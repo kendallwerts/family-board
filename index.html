@@ -65,6 +65,8 @@
   .icon-btn .dot { position: absolute; top: 6px; right: 6px; width: 9px; height: 9px; border-radius: 50%; background: var(--ink-soft); border: 2px solid var(--paper); }
   .icon-btn.is-connected { background: #EAF1E9; border-color: var(--sage); color: #3f5a3f; }
   .icon-btn.is-connected .dot { background: var(--sage); border-color: #EAF1E9; }
+  .icon-btn.is-working svg { animation: icon-spin 0.9s linear infinite; }
+  @keyframes icon-spin { to { transform: rotate(360deg); } }
   .tab-btn {
     flex: 1; border: none; background: transparent; color: var(--ink-soft);
     font-family: 'Inter', sans-serif; font-weight: 600; font-size: 0.95rem;
@@ -642,6 +644,9 @@
           <button class="tab-btn active" data-tab="mornings">Mornings</button>
         </div>
         <div class="tab-actions">
+          <button class="icon-btn" id="refreshBtn" title="Refresh now" aria-label="Refresh now">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          </button>
           <button class="icon-btn" id="connectBtn" title="Connect Google" aria-label="Connect Google">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
             <span class="dot"></span>
@@ -899,6 +904,7 @@
 
     <div class="field">
       <button class="btn-primary" type="button" id="settingsConnectGoogleBtn">Connect Google account</button>
+      <div class="hint" id="dataAgeHint"></div>
     </div>
 
     <div class="field">
@@ -1474,6 +1480,7 @@ function openSettings() {
     : 'Connect Google account';
   renderCalendarPicker();
   renderAmbientStatus();
+  document.getElementById('dataAgeHint').textContent = isConnected ? dataAgeLabel() : '';
   document.getElementById('morningStartInput').value = CONFIG.morningStart || DEFAULT_MORNING_START;
   document.getElementById('menuSheetInput').value = CONFIG.menuSheetId || '';
   document.getElementById('grocerySheetInput').value = CONFIG.sheetId || '';
@@ -1529,7 +1536,7 @@ document.getElementById('saveSettingsBtn').addEventListener('click', () => {
   CONFIG.sheetId = document.getElementById('grocerySheetInput').value.trim();
   saveConfig(CONFIG);
   updateMorningClock();
-  if (isConnected) { fetchMorningMenu(); fetchGroceries(); }
+  if (isConnected) refreshData({ allowWindow: true, force: true }); // a press, so a token is fine
   closeSettings();
 });
 
@@ -1553,26 +1560,39 @@ function setUpTokenClient() {
   }, 40); // ~10s of retrying for the script to load
 }
 
-/* Access tokens last about an hour and Google Identity Services hands out no
-   refresh token to a browser client, so the board has to ask for a new one
-   before the old expires — otherwise every call starts failing and the screen
-   quietly goes stale. A blip in that renewal must not drop us to demo data
-   either, so silent failures back off and try again. */
-let tokenRenewTimer = null;
-let silentRetries = 0;
+/* Access tokens last about an hour, and Google Identity Services hands out
+   no refresh token to a browser client — a new one always costs a call to
+   requestAccessToken, which opens a window, which Firefox on Android asks
+   permission for every single time.
+
+   The board used to renew on a timer five minutes before every expiry,
+   forever, whether or not anything needed the token: one permission prompt an
+   hour on a screen nobody is touching.
+
+   It no longer renews on a clock. A token is asked for only when the cached
+   data is actually due (see DATA CACHE below), and by preference from inside a
+   real touch — a window opened during a user gesture is never blocked, so the
+   everyday path costs no prompt at all. */
 let pendingInteractive = false;
 let tokenWaiters = [];
 let tokenExpiresAt = 0;
 let renewalInFlight = false;
 let renewalWatchdog = null;
+/* A browser that just ate one window will eat the next one too. Once an
+   attempt comes back empty, stop making unattended ones for a while — without
+   this, a screen the kids are tapping could raise a prompt every few seconds.
+   A deliberate press (the refresh button, Connect, saving settings) ignores
+   the cooldown, because that is a person asking for it. */
+let tokenCooldownUntil = 0;
+const TOKEN_COOLDOWN_MS = 10 * 60 * 1000;
 
-/* Every token request opens a window, and Firefox on Android asks permission
-   for each one. A token is good for about an hour, so parking it here means a
-   reload — a kiosk restart, a pulled plug, a manual refresh — reuses the token
-   it already has instead of asking Google (and the browser) all over again.
-   It lives only in this origin's storage on the family's own screen. */
+/* The token is parked in storage so a reload — a kiosk restart, a pulled plug
+   — reuses the one it already has instead of asking Google (and the browser)
+   all over again. It lives only in this origin's storage on the family's own
+   screen. */
 const TOKEN_KEY = 'homeboard_token_v1';
-const TOKEN_MIN_LIFE_MS = 10 * 60 * 1000; // don't restore one about to expire
+const LINKED_KEY = 'homeboard_linked_v1';
+const TOKEN_MIN_LIFE_MS = 60 * 1000; // below this it is not worth restoring
 
 function storeToken(token, expiresAt) {
   try { localStorage.setItem(TOKEN_KEY, JSON.stringify({ token, expiresAt })); } catch (e) { /* private mode */ }
@@ -1588,6 +1608,24 @@ function loadStoredToken() {
   return saved;
 }
 
+/* Being linked outlives the token. Consent was granted once; the access token
+   expiring an hour later does not undo it, and a board that has been linked
+   should go on showing the family's own data — from cache — rather than
+   dropping back to demo rows the moment the hour is up. */
+function markLinked(linked) {
+  try {
+    if (linked) localStorage.setItem(LINKED_KEY, '1');
+    else localStorage.removeItem(LINKED_KEY);
+  } catch (e) { /* private mode */ }
+}
+function wasLinked() {
+  try { return localStorage.getItem(LINKED_KEY) === '1'; } catch (e) { return false; }
+}
+
+function hasFreshToken() {
+  return Boolean(accessToken) && Date.now() < tokenExpiresAt - 60 * 1000;
+}
+
 function settleTokenWaiters(ok) {
   const waiters = tokenWaiters;
   tokenWaiters = [];
@@ -1597,57 +1635,66 @@ function settleTokenWaiters(ok) {
 function handleTokenResponse(resp) {
   endRenewal();
   if (resp.error) {
+    tokenCooldownUntil = Date.now() + TOKEN_COOLDOWN_MS;
     settleTokenWaiters(false);
-    if (pendingInteractive) { clearStoredToken(); setConnected(false); return; }
-    if (!accessToken) { clearStoredToken(); setConnected(false); } // nothing to fall back on yet
-    scheduleSilentRetry();
+    /* A silent refusal is nearly always the browser eating the window, not
+       Google withdrawing access — keep the link and the cached data, and let
+       the next touch try again. Only an interactive failure really means no. */
+    if (pendingInteractive) { clearStoredToken(); markLinked(false); setConnected(false); }
+    pendingInteractive = false;
     return;
   }
-  const firstToken = !accessToken;
-  silentRetries = 0;
+  const wasInteractive = pendingInteractive;
+  pendingInteractive = false;
+  tokenCooldownUntil = 0;
   accessToken = resp.access_token;
-  const lifetime = Number(resp.expires_in) || 3600;
-  tokenExpiresAt = Date.now() + lifetime * 1000;
+  tokenExpiresAt = Date.now() + (Number(resp.expires_in) || 3600) * 1000;
   storeToken(accessToken, tokenExpiresAt);
-  scheduleTokenRenewal(lifetime);
+  markLinked(true);
   setConnected(true);
   settleTokenWaiters(true);
-  if (firstToken) fetchAllData(); // a renewal lets the caller retry instead
+  // Someone who just pressed Connect wants their data now, not on the next cycle.
+  if (wasInteractive) refreshData({ allowWindow: false, force: true });
 }
 
-function scheduleTokenRenewal(lifetimeSeconds) {
-  clearTimeout(tokenRenewTimer);
-  // Five minutes early, so a slow network never leaves a gap.
-  tokenRenewTimer = setTimeout(() => requestAccessToken(false), Math.max(30, lifetimeSeconds - 300) * 1000);
-}
-
-/* Two quiet attempts cover a blip. Past that the cause is usually the browser
-   blocking the popup or third-party cookies — Firefox on Android does both by
-   default — and retrying only re-triggers its "allow this site to open a
-   window" prompt. So stop asking and let a person reconnect deliberately,
-   which is a real gesture and therefore always allowed to open a window. */
-function scheduleSilentRetry() {
-  clearTimeout(tokenRenewTimer);
-  if (silentRetries >= 2) { setConnected(false); return; }
-  const backoff = [60, 600][silentRetries];
-  silentRetries += 1;
-  tokenRenewTimer = setTimeout(() => requestAccessToken(false), backoff * 1000);
-}
-
-/* A blocked popup never calls back at all, so the in-flight flag needs its own
-   way out or renewals would wedge forever. */
+/* A blocked window never calls back at all, so the in-flight flag needs its own
+   way out or token requests would wedge forever. */
 function beginRenewal() {
   renewalInFlight = true;
   clearTimeout(renewalWatchdog);
   renewalWatchdog = setTimeout(() => {
     renewalInFlight = false;
+    tokenCooldownUntil = Date.now() + TOKEN_COOLDOWN_MS;  // silence means blocked
     settleTokenWaiters(false);
-    scheduleSilentRetry();
   }, 15000);
 }
 function endRenewal() {
   renewalInFlight = false;
   clearTimeout(renewalWatchdog);
+}
+
+/* Even a window the browser allows costs the kiosk its full screen: Firefox
+   on Android opens it as a tab and the board comes back windowed, with browser
+   chrome the kids should never see. Nothing can re-enter full screen on its
+   own — the API demands a gesture — so note that we lost it and put it back on
+   the next touch, which is exactly when someone is there to see it happen. */
+let lastTokenRequestAt = 0;
+let fullscreenBeforeToken = false;
+let restoreFullscreenPending = false;
+
+document.addEventListener('fullscreenchange', () => {
+  if (document.fullscreenElement) { restoreFullscreenPending = false; return; }
+  // Only ours to fix. Anything else — Escape on the laptop — is deliberate.
+  if (fullscreenBeforeToken && Date.now() - lastTokenRequestAt < 30000) {
+    restoreFullscreenPending = true;
+  }
+});
+
+function restoreFullscreenIfLost() {
+  if (!restoreFullscreenPending || document.fullscreenElement) return false;
+  restoreFullscreenPending = false;
+  document.documentElement.requestFullscreen().catch(() => {});
+  return true;
 }
 
 function requestAccessToken(interactive) {
@@ -1658,15 +1705,19 @@ function requestAccessToken(interactive) {
     beginRenewal();
   }
   pendingInteractive = interactive;
+  lastTokenRequestAt = Date.now();
+  fullscreenBeforeToken = Boolean(document.fullscreenElement);
   /* '' shows the consent screen only when consent is actually missing, so a
      reconnect after the first grant is silent — 'consent' would force Google's
      unverified-app warning every single time. 'none' guarantees a background
-     renewal never opens a window on a wall-mounted screen. */
+     grant never opens a visible dialog on a wall-mounted screen. */
   tokenClient.requestAccessToken({ prompt: interactive ? '' : 'none' });
 }
 
-/* Resolves once the next silent grant lands, so a 401 can wait for it. */
-function renewTokenSilently() {
+/* Resolves once the next silent grant lands. Called synchronously from inside
+   a touch handler wherever possible, so the window it opens still counts as
+   user-initiated. */
+function requestTokenNow() {
   if (!tokenClient) return Promise.resolve(false);
   return new Promise(resolve => {
     tokenWaiters.push(resolve);
@@ -1675,18 +1726,15 @@ function renewTokenSilently() {
   });
 }
 
-/* A kiosk that slept through the expiry should recover on its own — but only
-   when the token is genuinely near the end. This used to fire on every wake,
-   which on a browser that blocks popups meant a permission prompt every time
-   the screen came on. */
-function renewIfStale() {
-  if (!isConnected || !accessToken) return;
-  if (document.visibilityState !== 'visible') return;
-  if (Date.now() < tokenExpiresAt - 5 * 60 * 1000) return; // still fresh
-  requestAccessToken(false);
+/* The single gate in front of every Google call. allowWindow is the whole
+   point: false means "use the token if we have one, otherwise do nothing" —
+   which is what keeps an unattended board from ever raising a prompt. */
+function ensureToken(allowWindow, urgent) {
+  if (hasFreshToken()) return Promise.resolve(true);
+  if (!allowWindow) return Promise.resolve(false);
+  if (!urgent && Date.now() < tokenCooldownUntil) return Promise.resolve(false);
+  return requestTokenNow();
 }
-document.addEventListener('visibilitychange', renewIfStale);
-window.addEventListener('online', renewIfStale);
 
 function setConnected(connected) {
   isConnected = connected;
@@ -1709,40 +1757,45 @@ document.getElementById('connectBtn').addEventListener('click', () => {
     accessToken = null;
     tokenExpiresAt = 0;
     clearStoredToken();
-    clearTimeout(tokenRenewTimer);
-    silentRetries = 0;
+    markLinked(false);
+    clearCachedData();
     liveEvents = liveCalendars = liveTasks = liveGroceries = liveMorningMenus = null;
     setConnected(false);
-    renderCalendar();
-    renderTaskLanes();
-    renderGroceries();
-    renderMorningMenu();
+    renderLiveData();
     return;
   }
   if (!CONFIG.clientId) { openSettings(); return; }
-  silentRetries = 0;
   endRenewal();
   setUpTokenClient();
-  requestAccessToken(true);
+  requestAccessToken(true);   // a real press, so this window is never blocked
 });
 
-// On page load, reuse the token from the last session if it still has real
-// life in it — that reload then costs no window and no permission prompt at
-// all. Only when there is nothing usable do we fall back to asking Google for
-// a silent grant, which is what lets a kiosk skip the login screen.
+/* The refresh button is the manual escape hatch, and it is a press — so it may
+   always open a window for a token, however stale things have got. */
+document.getElementById('refreshBtn').addEventListener('click', () => {
+  if (!isConnected) { document.getElementById('connectBtn').click(); return; }
+  refreshData({ allowWindow: true, force: true });
+});
+
+/* On load the board draws from cache first — instantly, with no network and no
+   token — and only then considers refreshing. If the parked token is still
+   alive that refresh is free; if it is not, nothing happens here, because a
+   boot is not a gesture and asking now would raise exactly the prompt this is
+   all meant to avoid. The first touch will pick it up. */
 window.addEventListener('load', () => {
+  restoreCachedData();
   if (!CONFIG.clientId) return;
   setUpTokenClient();
   const saved = loadStoredToken();
   if (saved) {
     accessToken = saved.token;
     tokenExpiresAt = saved.expiresAt;
-    scheduleTokenRenewal(Math.floor((saved.expiresAt - Date.now()) / 1000));
-    setConnected(true);
-    fetchAllData(); // a stale token surfaces as a 401 and renews from there
-    return;
   }
-  waitForGis(() => requestAccessToken(false), 40);
+  if (saved || wasLinked()) {
+    setConnected(true);
+    renderLiveData();
+    refreshData({ allowWindow: false });
+  }
 });
 
 /* =========================================================================
@@ -1783,7 +1836,7 @@ async function gfetch(url, options, isRetry) {
     },
   });
   if ((res.status === 401 || res.status === 403) && !isRetry) {
-    if (await renewTokenSilently()) return gfetch(url, options, true);
+    if (await requestTokenNow()) return gfetch(url, options, true);
   }
   if (!res.ok) {
     const body = await res.text().catch(() => '');
@@ -1792,9 +1845,143 @@ async function gfetch(url, options, isRetry) {
   return res.status === 204 ? null : res.json();
 }
 
+/* Each fetch swallows its own error so one dead endpoint cannot take the
+   others down with it — this counts them, so a round that went badly is not
+   written over a good cache. */
+let fetchErrorCount = 0;
+
 async function fetchAllData() {
+  fetchErrorCount = 0;
   await Promise.allSettled([fetchCalendar(), fetchTasks(), fetchGroceries(), fetchMorningMenu()]);
 }
+
+/* =========================================================================
+   DATA CACHE — what the board last heard from Google, kept on the device.
+
+   None of this changes minute to minute: a day's lunch row, today's calendar,
+   a grocery list. Holding the last answer in localStorage means the board can
+   draw a complete screen the instant it loads, and — the point of the whole
+   exercise — that a refresh is something the board chooses to do rather than
+   something it is forced into every hour by an expiring token.
+
+   The policy, in one place:
+     · Data is due when the day has rolled over, or it is older than an hour.
+     · With a live token, top it up freely — that costs nothing.
+     · Without one, ask for a token ONLY from a real gesture: a touch, the
+       refresh button, Connect, saving settings. Never on a timer, never on a
+       wake, never overnight. Asking drops a kiosk out of full screen even when
+       the browser allows it, so a board nobody is standing at must never ask.
+   ========================================================================= */
+const DATA_KEY = 'homeboard_data_v1';
+const DATA_MAX_AGE_MS = 60 * 60 * 1000;   // an hour is plenty for a lunch row
+let dataSavedAt = 0;
+let dataDayKey = '';
+let refreshInFlight = false;
+
+function renderLiveData() {
+  renderCalendar();
+  renderTaskLanes();
+  renderGroceries();
+  renderMorningMenu();
+}
+
+function saveCachedData() {
+  try {
+    localStorage.setItem(DATA_KEY, JSON.stringify({
+      savedAt: dataSavedAt,
+      dayKey: dataDayKey,
+      // Dates do not survive JSON; store the instant and rebuild on the way in.
+      events: liveEvents && liveEvents.map(ev => ({ ...ev, start: ev.start.toISOString() })),
+      calendars: liveCalendars,
+      tasks: liveTasks,
+      groceries: liveGroceries,
+      menus: liveMorningMenus,
+    }));
+  } catch (e) { /* private mode or quota — the board just refetches sooner */ }
+}
+
+function clearCachedData() {
+  dataSavedAt = 0;
+  dataDayKey = '';
+  try { localStorage.removeItem(DATA_KEY); } catch (e) { /* private mode */ }
+}
+
+function restoreCachedData() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(DATA_KEY)); } catch (e) { return; }
+  if (!saved) return;
+  dataSavedAt = saved.savedAt || 0;
+  dataDayKey = saved.dayKey || '';
+  if (Array.isArray(saved.events)) liveEvents = saved.events.map(ev => ({ ...ev, start: new Date(ev.start) }));
+  if (saved.calendars) liveCalendars = saved.calendars;
+  if (saved.tasks) liveTasks = saved.tasks;
+  if (saved.groceries) liveGroceries = saved.groceries;
+  if (saved.menus) liveMorningMenus = saved.menus;
+}
+
+function dataIsDue() {
+  if (!dataSavedAt) return true;
+  if (dataDayKey !== dayKey()) return true;   // a new day needs new everything
+  return Date.now() - dataSavedAt > DATA_MAX_AGE_MS;
+}
+
+function dataAgeLabel() {
+  if (!dataSavedAt) return 'No data loaded yet.';
+  const minutes = Math.round((Date.now() - dataSavedAt) / 60000);
+  if (minutes < 1) return 'Refreshed just now.';
+  if (minutes < 60) return `Refreshed ${minutes} minute${minutes === 1 ? '' : 's'} ago.`;
+  return `Refreshed ${new Date(dataSavedAt).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' })}.`;
+}
+
+/* allowWindow must stay true only on paths that a person actually started.
+   force skips the staleness check (the refresh button, a settings change). */
+async function refreshData({ allowWindow = false, force = false } = {}) {
+  if (!isConnected || refreshInFlight) return false;
+  if (!force && !dataIsDue()) return false;
+  if (!hasFreshToken() && !allowWindow) return false;
+  const btn = document.getElementById('refreshBtn');
+  refreshInFlight = true;
+  btn.classList.add('is-working');
+  try {
+    // Nothing may be awaited before this call, or the gesture is spent and the
+    // window it opens gets blocked.
+    if (!await ensureToken(allowWindow, force)) return false;
+    await fetchAllData();
+    /* Stamp the time either way: a refresh that keeps failing must not leave
+       the board permanently "due" and asking for a token on every touch. But
+       only a clean round gets written to storage. */
+    dataSavedAt = Date.now();
+    dataDayKey = dayKey();
+    if (!fetchErrorCount) saveCachedData();
+    return !fetchErrorCount;
+  } finally {
+    refreshInFlight = false;
+    btn.classList.remove('is-working');
+  }
+}
+
+/* The first touch of a stale board is the good moment to refresh: a token
+   requested from inside a gesture opens its window without asking anyone's
+   permission. Capture phase, so it runs before whatever the touch was for. */
+document.addEventListener('pointerdown', () => {
+  /* One gesture, one job: requesting full screen spends the activation that
+     opening a window would need, so never attempt both on the same touch. A
+     restore only ever follows a token request, so nothing is due anyway. */
+  if (restoreFullscreenIfLost()) return;
+  refreshData({ allowWindow: true });
+}, { capture: true });
+
+/* Waking the screen is not a gesture, so this only ever uses a token already
+   in hand — it will not raise a prompt. */
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') refreshData({ allowWindow: false });
+});
+window.addEventListener('online', () => refreshData({ allowWindow: false }));
+
+/* The heartbeat only ever spends a token that is already in hand, so it can
+   never open a window. A board sitting untouched overnight keeps yesterday's
+   answer on screen, in full screen, and picks up today on the first touch. */
+setInterval(() => refreshData({ allowWindow: false }), 5 * 60 * 1000);
 
 /* ---- Calendar: one "lane" per calendar the account has, tagged by that
    calendar's name. Set up a separate Google Calendar per family member
@@ -1856,6 +2043,7 @@ async function fetchCalendar() {
 
     liveEvents = results.flat().sort((a, b) => a.start - b.start);
   } catch (err) {
+    fetchErrorCount += 1;
     console.error('Calendar fetch failed', err);
     liveEvents = liveEvents || [];
   }
@@ -1895,6 +2083,7 @@ async function fetchTasks() {
 
     liveTasks = results.flat();
   } catch (err) {
+    fetchErrorCount += 1;
     console.error('Tasks fetch failed', err);
     liveTasks = liveTasks || [];
   }
@@ -1905,12 +2094,16 @@ async function toggleLiveTask(task) {
   const newDone = !task.done;
   task.done = newDone; // optimistic
   renderTaskLanes();
+  // Called straight from the tap, so this may open a window if the hour is up.
+  const tokenPromise = ensureToken(true);
   try {
+    if (!await tokenPromise) throw new Error('no access token');
     await gfetch(`https://www.googleapis.com/tasks/v1/lists/${task.tasklistId}/tasks/${task.taskId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: newDone ? 'completed' : 'needsAction' }),
     });
+    saveCachedData();
   } catch (err) {
     console.error('Task update failed, reverting', err);
     task.done = !newDone;
@@ -1935,6 +2128,7 @@ async function fetchGroceries() {
       }))
       .filter(g => g.label);
   } catch (err) {
+    fetchErrorCount += 1;
     console.error('Sheet fetch failed', err);
     liveGroceries = liveGroceries || [];
   }
@@ -1956,8 +2150,9 @@ async function fetchMorningMenu() {
     });
     liveMorningMenus = byDay;
   } catch (err) {
+    fetchErrorCount += 1;
     console.error('Morning menu fetch failed', err);
-    liveMorningMenus = null;
+    liveMorningMenus = liveMorningMenus || null;
   }
   renderMorningMenu();
 }
@@ -1966,13 +2161,16 @@ async function toggleLiveGrocery(item) {
   const newDone = !item.done;
   item.done = newDone; // optimistic
   renderGroceries();
+  const tokenPromise = ensureToken(true);
   try {
+    if (!await tokenPromise) throw new Error('no access token');
     const cell = `${sheetPrefixFor(CONFIG.sheetId, CONFIG.sheetRange || 'Groceries!A2:C200')}C${item.rowNumber}`;
     await gfetch(`https://sheets.googleapis.com/v4/spreadsheets/${CONFIG.sheetId}/values/${encodeURIComponent(cell)}?valueInputOption=RAW`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ range: cell, values: [[newDone ? 'TRUE' : 'FALSE']] }),
     });
+    saveCachedData();
   } catch (err) {
     console.error('Grocery update failed, reverting', err);
     item.done = !newDone;
@@ -1981,14 +2179,17 @@ async function toggleLiveGrocery(item) {
 }
 
 async function addLiveGrocery(label, qty) {
+  const tokenPromise = ensureToken(true);
   const configured = CONFIG.sheetRange || 'Groceries!A2:C200';
   const range = sheetPrefixFor(CONFIG.sheetId, configured) + (configured.includes('!') ? configured.split('!').slice(1).join('!') : configured);
+  if (!await tokenPromise) throw new Error('Could not reach Google — tap the refresh button and try again.');
   await gfetch(`https://sheets.googleapis.com/v4/spreadsheets/${CONFIG.sheetId}/values/${encodeURIComponent(range)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ values: [[label, qty, false]] }),
   });
   await fetchGroceries();
+  saveCachedData();
 }
 
 document.getElementById('groceryAddForm').addEventListener('submit', async event => {
@@ -2179,9 +2380,7 @@ document.getElementById('refreshPhotosBtn').addEventListener('click', () => {
   });
 });
 
-// Refresh live data periodically while connected (calendars/tasks/lists
-// change throughout the day).
-setInterval(() => { if (isConnected) fetchAllData(); }, 5 * 60 * 1000);
+// Live data refreshes are governed by the DATA CACHE section above.
 
 /* =========================================================================
    RENDER: CALENDAR (uses liveEvents if connected, else DEMO_EVENTS)
@@ -2971,7 +3170,7 @@ setInterval(tick, 1000);
   function refreshEverything() {
     tick();                 // header clock, date line, ambient wash, dial + ring
     renderWeather();        // strip + weather backdrop
-    if (isConnected) fetchMorningMenu(); else renderMorningMenu(); // lunch is a per-weekday row
+    if (isConnected && hasFreshToken()) fetchMorningMenu(); else renderMorningMenu(); // lunch is a per-weekday row
     checklist = loadChecklist();
     renderChecklists();
     renderAfterSchool();

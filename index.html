@@ -207,17 +207,26 @@
   /* The trend sits under the hi/lo pill rather than under the condition: that
      column is sized by the pill, which is wider than the sentence, so it has
      room to spare where the condition column had none. */
+  /* Two columns, marks in one and figures in the other. Right-aligning whole
+     lines instead lines up their right edges, which pushed the umbrella out
+     past the arrows above it whenever the rain figure was the narrowest. */
+  /* Mark in one column, reading in the other and centred there, so a lone "1%"
+     sits under the middle of "96°" instead of under its last character.
+     Splitting the unit into a third column lines the ° and % up too, but then
+     a centred "1" leaves a gap before its "%" and reads as "1 %". */
   .weather-strip-stats {
-    display: flex; flex-direction: column; align-items: flex-end; gap: 1px; flex-shrink: 0;
+    display: grid; grid-template-columns: auto auto; align-items: center;
+    column-gap: 7px; row-gap: 1px; flex-shrink: 0;
     font-family: 'IBM Plex Mono', monospace; font-weight: 600; line-height: 1.35;
     font-size: clamp(0.88rem, 1.7vw, 1.1rem);
   }
-  .weather-strip-stats span { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .weather-strip-stats .mark { justify-self: center; line-height: 1; }
+  .weather-strip-stats .val { justify-self: center; font-variant-numeric: tabular-nums; }
   .weather-strip-stats .hi { color: var(--red); }
   .weather-strip-stats .lo { color: var(--dusk); }
   .weather-strip-stats .rain { color: #3E6E8E; }
   /* The umbrella glyph draws smaller than the arrows at the same font size. */
-  .weather-strip-stats .mark { font-size: 1.35em; line-height: 1; vertical-align: -0.06em; }
+  .weather-strip-stats .rain.mark { font-size: 1.35em; }
 
   /* With the description moved onto the dial the flanks come out at 118px and
      129px, so squaring them up costs the curve almost nothing and it can stay
@@ -417,7 +426,7 @@
     .now-weather { order: 2; flex: 0 0 auto; justify-content: flex-end; gap: 10px; }
     .temp-curve { order: 3; flex: 0 0 100%; }
     .now-clock { font-size: 1.35rem; }
-    .weather-strip-stats { gap: 6px; padding: 4px 8px; }
+    .weather-strip-stats { column-gap: 6px; }
     .menu-row { gap: 6px; }
     .menu-chip { padding: 5px 11px 5px 8px; gap: 6px; }
     /* Too narrow to park the week button beside the title without overlapping
@@ -1434,9 +1443,9 @@ function renderWeather() {
       <div class="weather-strip-temp"><b>${temp}°</b></div>
     </div>
     <div class="weather-strip-stats">
-      <span class="hi">↑ ${high}°</span>
-      <span class="lo">↓ ${low}°</span>
-      <span class="rain"><span class="mark">☂</span> ${rainChance}%</span>
+      <span class="hi mark">↑</span><span class="hi val">${high}°</span>
+      <span class="lo mark">↓</span><span class="lo val">${low}°</span>
+      <span class="rain mark">☂</span><span class="rain val">${rainChance}%</span>
     </div>`;
   renderTempCurve(temp, fake ? fake.temp - current.temperature_2m : 0);
 }

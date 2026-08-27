@@ -167,9 +167,6 @@
   .calendar-choice .swatch { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
   .calendar-group-title { margin: 7px 0 1px; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-soft); }
   .calendar-group-title:first-child { margin-top: 0; }
-  .ambient-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-  .ambient-status { margin-top: 9px; padding: 10px 12px; border-radius: 10px; background: var(--paper); font-size: 0.78rem; line-height: 1.5; }
-  .ambient-status:empty { display: none; }
 
   /* ================= MORNINGS ================= */
   .morning-layout { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(280px, 1fr) minmax(330px, 1.02fr); gap: 22px; }
@@ -644,7 +641,7 @@
           <button class="tab-btn active" data-tab="mornings">Mornings</button>
         </div>
         <div class="tab-actions">
-          <button class="icon-btn" id="refreshBtn" title="Refresh now" aria-label="Refresh now">
+          <button class="icon-btn" id="refreshBtn" title="Refresh from Google" aria-label="Refresh from Google">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
           </button>
           <button class="icon-btn" id="connectBtn" title="Connect Google" aria-label="Connect Google">
@@ -916,16 +913,6 @@
     </div>
 
     <div class="field">
-      <label>Google Photos</label>
-      <div class="hint">Connect the Google Photos account used for the board’s sleep screen.</div>
-      <div class="ambient-actions">
-        <button class="btn-secondary" type="button" id="connectPhotosBtn">Connect Google Photos</button>
-        <button class="btn-secondary" type="button" id="refreshPhotosBtn">Refresh photos</button>
-      </div>
-      <div class="ambient-status" id="ambientStatus"></div>
-    </div>
-
-    <div class="field">
       <label for="menuSheetInput">Menu spreadsheet ID</label>
       <input type="text" id="menuSheetInput" placeholder="1AbC…" autocomplete="off" spellcheck="false">
       <div class="hint">From the sheet's URL, the part between <code>/d/</code> and <code>/edit</code>. Needs a tab named <code>Mornings</code>: weekday, main, veggie, fruit, extra — one row per day from row 2.</div>
@@ -953,7 +940,7 @@
 <script>
 /* =========================================================================
    CONFIG — deployment values are injected by GitHub Actions. Device choices
-   such as selected calendars and Ambient device metadata stay in localStorage.
+   such as the selected calendars stay in localStorage.
    ========================================================================= */
 const CONFIG_KEY = 'homeboard_config_v1';
 const DEPLOYED_CONFIG = /*__DEPLOYED_CONFIG__*/ {};
@@ -1479,8 +1466,9 @@ function openSettings() {
     ? 'Disconnect Google account'
     : 'Connect Google account';
   renderCalendarPicker();
-  renderAmbientStatus();
-  document.getElementById('dataAgeHint').textContent = isConnected ? dataAgeLabel() : '';
+  document.getElementById('dataAgeHint').textContent = isConnected
+    ? `${dataAgeLabel()} The board holds a week and only asks Google when you press ⟳. Build ${BOARD_BUILD}.`
+    : `Build ${BOARD_BUILD}.`;
   document.getElementById('morningStartInput').value = CONFIG.morningStart || DEFAULT_MORNING_START;
   document.getElementById('menuSheetInput').value = CONFIG.menuSheetId || '';
   document.getElementById('grocerySheetInput').value = CONFIG.sheetId || '';
@@ -1526,8 +1514,6 @@ document.getElementById('settingsConnectGoogleBtn').addEventListener('click', ()
 });
 
 document.getElementById('saveSettingsBtn').addEventListener('click', () => {
-  delete CONFIG.ambientClientSecret;
-  delete CONFIG.ambientRefreshToken;
   if (liveCalendars) {
     CONFIG.calendarIds = Array.from(document.querySelectorAll('#calendarPicker input:checked')).map(input => input.value);
   }
@@ -1536,7 +1522,7 @@ document.getElementById('saveSettingsBtn').addEventListener('click', () => {
   CONFIG.sheetId = document.getElementById('grocerySheetInput').value.trim();
   saveConfig(CONFIG);
   updateMorningClock();
-  if (isConnected) refreshData({ allowWindow: true, force: true }); // a press, so a token is fine
+  if (isConnected) refreshData();   // a press, so a token is fine
   closeSettings();
 });
 
@@ -1578,13 +1564,6 @@ let tokenWaiters = [];
 let tokenExpiresAt = 0;
 let renewalInFlight = false;
 let renewalWatchdog = null;
-/* A browser that just ate one window will eat the next one too. Once an
-   attempt comes back empty, stop making unattended ones for a while — without
-   this, a screen the kids are tapping could raise a prompt every few seconds.
-   A deliberate press (the refresh button, Connect, saving settings) ignores
-   the cooldown, because that is a person asking for it. */
-let tokenCooldownUntil = 0;
-const TOKEN_COOLDOWN_MS = 10 * 60 * 1000;
 
 /* The token is parked in storage so a reload — a kiosk restart, a pulled plug
    — reuses the one it already has instead of asking Google (and the browser)
@@ -1635,7 +1614,6 @@ function settleTokenWaiters(ok) {
 function handleTokenResponse(resp) {
   endRenewal();
   if (resp.error) {
-    tokenCooldownUntil = Date.now() + TOKEN_COOLDOWN_MS;
     settleTokenWaiters(false);
     /* A silent refusal is nearly always the browser eating the window, not
        Google withdrawing access — keep the link and the cached data, and let
@@ -1646,7 +1624,6 @@ function handleTokenResponse(resp) {
   }
   const wasInteractive = pendingInteractive;
   pendingInteractive = false;
-  tokenCooldownUntil = 0;
   accessToken = resp.access_token;
   tokenExpiresAt = Date.now() + (Number(resp.expires_in) || 3600) * 1000;
   storeToken(accessToken, tokenExpiresAt);
@@ -1654,17 +1631,16 @@ function handleTokenResponse(resp) {
   setConnected(true);
   settleTokenWaiters(true);
   // Someone who just pressed Connect wants their data now, not on the next cycle.
-  if (wasInteractive) refreshData({ allowWindow: false, force: true });
+  if (wasInteractive) refreshData();
 }
 
-/* A blocked window never calls back at all, so the in-flight flag needs its own
-   way out or token requests would wedge forever. */
+/* A blocked window never calls back at all, so the in-flight flag needs its
+   own way out or token requests would wedge forever. */
 function beginRenewal() {
   renewalInFlight = true;
   clearTimeout(renewalWatchdog);
   renewalWatchdog = setTimeout(() => {
     renewalInFlight = false;
-    tokenCooldownUntil = Date.now() + TOKEN_COOLDOWN_MS;  // silence means blocked
     settleTokenWaiters(false);
   }, 15000);
 }
@@ -1673,26 +1649,34 @@ function endRenewal() {
   clearTimeout(renewalWatchdog);
 }
 
-/* Even a window the browser allows costs the kiosk its full screen: Firefox
-   on Android opens it as a tab and the board comes back windowed, with browser
-   chrome the kids should never see. Nothing can re-enter full screen on its
-   own — the API demands a gesture — so note that we lost it and put it back on
-   the next touch, which is exactly when someone is there to see it happen. */
-let lastTokenRequestAt = 0;
-let fullscreenBeforeToken = false;
-let restoreFullscreenPending = false;
+/* KIOSK MODE. Pressing the full-screen button does not just go full screen,
+   it declares "this device is the wall board", and that sticks in localStorage
+   across reloads and reboots. So anything that drops the board out of full
+   screen — a token window opening as a tab, a kiosk restart, a crash — is
+   repaired by the next touch. Nothing can re-enter full screen on its own; the
+   API demands a gesture, and a touch is the first gesture going.
 
-document.addEventListener('fullscreenchange', () => {
-  if (document.fullscreenElement) { restoreFullscreenPending = false; return; }
-  // Only ours to fix. Anything else — Escape on the laptop — is deliberate.
-  if (fullscreenBeforeToken && Date.now() - lastTokenRequestAt < 30000) {
-    restoreFullscreenPending = true;
-  }
-});
+   The first version of this tried to be clever, watching fullscreenchange and
+   only repairing exits within 30 seconds of a token request. It failed in the
+   field for the obvious reason: a person walks over, reads the prompt, taps
+   allow, and by then the 30 seconds are long gone. Persist the intent instead
+   of trying to infer it.
+
+   Press the button again to turn it off. Escape alone will not: on the wall
+   that is the whole point, and on a laptop the button is right there. */
+const KIOSK_KEY = 'homeboard_kiosk_v1';
+function kioskMode() {
+  try { return localStorage.getItem(KIOSK_KEY) === '1'; } catch (e) { return false; }
+}
+function setKioskMode(on) {
+  try {
+    if (on) localStorage.setItem(KIOSK_KEY, '1');
+    else localStorage.removeItem(KIOSK_KEY);
+  } catch (e) { /* private mode */ }
+}
 
 function restoreFullscreenIfLost() {
-  if (!restoreFullscreenPending || document.fullscreenElement) return false;
-  restoreFullscreenPending = false;
+  if (!kioskMode() || document.fullscreenElement) return false;
   document.documentElement.requestFullscreen().catch(() => {});
   return true;
 }
@@ -1705,8 +1689,6 @@ function requestAccessToken(interactive) {
     beginRenewal();
   }
   pendingInteractive = interactive;
-  lastTokenRequestAt = Date.now();
-  fullscreenBeforeToken = Boolean(document.fullscreenElement);
   /* '' shows the consent screen only when consent is actually missing, so a
      reconnect after the first grant is silent — 'consent' would force Google's
      unverified-app warning every single time. 'none' guarantees a background
@@ -1726,13 +1708,10 @@ function requestTokenNow() {
   });
 }
 
-/* The single gate in front of every Google call. allowWindow is the whole
-   point: false means "use the token if we have one, otherwise do nothing" —
-   which is what keeps an unattended board from ever raising a prompt. */
-function ensureToken(allowWindow, urgent) {
+/* The single gate in front of every Google call. Only ever reached from a
+   press, so it is always allowed to open a window. */
+function ensureToken() {
   if (hasFreshToken()) return Promise.resolve(true);
-  if (!allowWindow) return Promise.resolve(false);
-  if (!urgent && Date.now() < tokenCooldownUntil) return Promise.resolve(false);
   return requestTokenNow();
 }
 
@@ -1774,14 +1753,12 @@ document.getElementById('connectBtn').addEventListener('click', () => {
    always open a window for a token, however stale things have got. */
 document.getElementById('refreshBtn').addEventListener('click', () => {
   if (!isConnected) { document.getElementById('connectBtn').click(); return; }
-  refreshData({ allowWindow: true, force: true });
+  refreshData();
 });
 
-/* On load the board draws from cache first — instantly, with no network and no
-   token — and only then considers refreshing. If the parked token is still
-   alive that refresh is free; if it is not, nothing happens here, because a
-   boot is not a gesture and asking now would raise exactly the prompt this is
-   all meant to avoid. The first touch will pick it up. */
+/* On load the board draws from cache. That is the whole of it — instantly,
+   with no network and no token. A boot is not a press, so it does not fetch,
+   and the week of data it already holds is enough to be right. */
 window.addEventListener('load', () => {
   restoreCachedData();
   if (!CONFIG.clientId) return;
@@ -1794,7 +1771,6 @@ window.addEventListener('load', () => {
   if (saved || wasLinked()) {
     setConnected(true);
     renderLiveData();
-    refreshData({ allowWindow: false });
   }
 });
 
@@ -1858,25 +1834,42 @@ async function fetchAllData() {
 /* =========================================================================
    DATA CACHE — what the board last heard from Google, kept on the device.
 
-   None of this changes minute to minute: a day's lunch row, today's calendar,
-   a grocery list. Holding the last answer in localStorage means the board can
-   draw a complete screen the instant it loads, and — the point of the whole
-   exercise — that a refresh is something the board chooses to do rather than
-   something it is forced into every hour by an expiring token.
+   None of this changes minute to minute: a day's lunch row, a week's
+   calendar, a grocery list. Holding the last answer in localStorage means the
+   board draws a complete screen the instant it loads, with no network at all.
 
-   The policy, in one place:
-     · Data is due when the day has rolled over, or it is older than an hour.
-     · With a live token, top it up freely — that costs nothing.
-     · Without one, ask for a token ONLY from a real gesture: a touch, the
-       refresh button, Connect, saving settings. Never on a timer, never on a
-       wake, never overnight. Asking drops a kiosk out of full screen even when
-       the browser allows it, so a board nobody is standing at must never ask.
+   The policy, in one line: **the refresh button is the only door.**
+
+   Nothing else talks to Google. Not a timer, not a touch, not a screen wake,
+   not the clock rolling over to a new day. Press ⟳ and the board fetches a
+   week in one go — the calendar already asks for seven days ahead, the lunch
+   sheet is a whole week per read — and then it is silent until pressed again.
+
+   The reason is not politeness. Getting a token opens a window; a window
+   costs a permission prompt on the tablet and drops the kiosk out of full
+   screen. So the board asks once, deliberately, with a person standing in
+   front of it, and never at six in the morning with only the kids there.
    ========================================================================= */
+const BOARD_BUILD = '2026-08-27b';   // shown in Settings; bump when shipping
 const DATA_KEY = 'homeboard_data_v1';
-const DATA_MAX_AGE_MS = 60 * 60 * 1000;   // an hour is plenty for a lunch row
 let dataSavedAt = 0;
 let dataDayKey = '';
 let refreshInFlight = false;
+
+/* Ticking a task or a grocery writes to Google, and that needs a live token.
+   The board will not go and get one on its own any more, so say so in the
+   space the "Demo data" tag uses rather than failing silently. */
+function needsRefreshNotice(eyebrowId) {
+  const el = document.getElementById(eyebrowId);
+  if (!el) return;
+  const previous = el.textContent;
+  el.textContent = 'Press ⟳ to reconnect first';
+  el.classList.remove('is-hidden');
+  setTimeout(() => {
+    el.textContent = previous;
+    if (isConnected) el.classList.add('is-hidden');
+  }, 4000);
+}
 
 function renderLiveData() {
   renderCalendar();
@@ -1919,33 +1912,24 @@ function restoreCachedData() {
   if (saved.menus) liveMorningMenus = saved.menus;
 }
 
-function dataIsDue() {
-  if (!dataSavedAt) return true;
-  if (dataDayKey !== dayKey()) return true;   // a new day needs new everything
-  return Date.now() - dataSavedAt > DATA_MAX_AGE_MS;
-}
-
 function dataAgeLabel() {
-  if (!dataSavedAt) return 'No data loaded yet.';
+  if (!dataSavedAt) return 'Nothing loaded yet — press ⟳.';
   const minutes = Math.round((Date.now() - dataSavedAt) / 60000);
   if (minutes < 1) return 'Refreshed just now.';
   if (minutes < 60) return `Refreshed ${minutes} minute${minutes === 1 ? '' : 's'} ago.`;
   return `Refreshed ${new Date(dataSavedAt).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' })}.`;
 }
 
-/* allowWindow must stay true only on paths that a person actually started.
-   force skips the staleness check (the refresh button, a settings change). */
-async function refreshData({ allowWindow = false, force = false } = {}) {
+/* Only ever called from a press: the ⟳ button, Connect, saving settings. */
+async function refreshData() {
   if (!isConnected || refreshInFlight) return false;
-  if (!force && !dataIsDue()) return false;
-  if (!hasFreshToken() && !allowWindow) return false;
   const btn = document.getElementById('refreshBtn');
   refreshInFlight = true;
   btn.classList.add('is-working');
   try {
-    // Nothing may be awaited before this call, or the gesture is spent and the
-    // window it opens gets blocked.
-    if (!await ensureToken(allowWindow, force)) return false;
+    // Nothing may be awaited before this call, or the gesture is spent and
+    // the window it opens gets blocked.
+    if (!await ensureToken()) return false;
     await fetchAllData();
     /* Stamp the time either way: a refresh that keeps failing must not leave
        the board permanently "due" and asking for a token on every touch. But
@@ -1960,28 +1944,16 @@ async function refreshData({ allowWindow = false, force = false } = {}) {
   }
 }
 
-/* The first touch of a stale board is the good moment to refresh: a token
-   requested from inside a gesture opens its window without asking anyone's
-   permission. Capture phase, so it runs before whatever the touch was for. */
-document.addEventListener('pointerdown', () => {
-  /* One gesture, one job: requesting full screen spends the activation that
-     opening a window would need, so never attempt both on the same touch. A
-     restore only ever follows a token request, so nothing is due anyway. */
-  if (restoreFullscreenIfLost()) return;
-  refreshData({ allowWindow: true });
-}, { capture: true });
+/* A touch does one thing now: put the board back in full screen if something
+   knocked it out. It never fetches and never asks for a token.
 
-/* Waking the screen is not a gesture, so this only ever uses a token already
-   in hand — it will not raise a prompt. */
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') refreshData({ allowWindow: false });
-});
-window.addEventListener('online', () => refreshData({ allowWindow: false }));
-
-/* The heartbeat only ever spends a token that is already in hand, so it can
-   never open a window. A board sitting untouched overnight keeps yesterday's
-   answer on screen, in full screen, and picks up today on the first touch. */
-setInterval(() => refreshData({ allowWindow: false }), 5 * 60 * 1000);
+   If a token request is ever wired to an event again, it must be pointerup or
+   another entry in Firefox's `dom.popup_allowed_events` — by default: change
+   click dblclick mouseup pointerup notificationclick reset submit touchend.
+   pointerdown is not on that list, nor mousedown, nor touchstart. An earlier
+   version hooked pointerdown, so every request counted as unsolicited and the
+   tablet prompted once an hour anyway. Check the list first. */
+document.addEventListener('pointerup', restoreFullscreenIfLost, { capture: true });
 
 /* ---- Calendar: one "lane" per calendar the account has, tagged by that
    calendar's name. Set up a separate Google Calendar per family member
@@ -2056,8 +2028,6 @@ async function fetchTasks() {
   try {
     const listsResp = await gfetch('https://www.googleapis.com/tasks/v1/users/@me/lists');
     const lists = listsResp.items || [];
-    const now = new Date();
-    const todayKey = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
 
     const results = await Promise.all(lists.map(async list => {
       const tasks = [];
@@ -2069,8 +2039,11 @@ async function fetchTasks() {
         tasks.push(...(data.items || []));
         pageToken = data.nextPageToken || '';
       } while (pageToken);
+      /* Keep the whole week. Which of them count as due is decided at render
+         time, in currentTasks(), because this cache outlives the day it was
+         fetched on. */
       return tasks
-        .filter(t => t.title && t.status !== 'completed' && t.due && t.due.slice(0, 10) <= todayKey)
+        .filter(t => t.title && t.status !== 'completed' && t.due)
         .map(t => ({
           label: t.title,
           who: list.title,
@@ -2091,13 +2064,11 @@ async function fetchTasks() {
 }
 
 async function toggleLiveTask(task) {
+  if (!hasFreshToken()) { needsRefreshNotice('tasksEyebrow'); return; }
   const newDone = !task.done;
   task.done = newDone; // optimistic
   renderTaskLanes();
-  // Called straight from the tap, so this may open a window if the hour is up.
-  const tokenPromise = ensureToken(true);
   try {
-    if (!await tokenPromise) throw new Error('no access token');
     await gfetch(`https://www.googleapis.com/tasks/v1/lists/${task.tasklistId}/tasks/${task.taskId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -2158,12 +2129,11 @@ async function fetchMorningMenu() {
 }
 
 async function toggleLiveGrocery(item) {
+  if (!hasFreshToken()) { needsRefreshNotice('groceryEyebrow'); return; }
   const newDone = !item.done;
   item.done = newDone; // optimistic
   renderGroceries();
-  const tokenPromise = ensureToken(true);
   try {
-    if (!await tokenPromise) throw new Error('no access token');
     const cell = `${sheetPrefixFor(CONFIG.sheetId, CONFIG.sheetRange || 'Groceries!A2:C200')}C${item.rowNumber}`;
     await gfetch(`https://sheets.googleapis.com/v4/spreadsheets/${CONFIG.sheetId}/values/${encodeURIComponent(cell)}?valueInputOption=RAW`, {
       method: 'PUT',
@@ -2179,10 +2149,9 @@ async function toggleLiveGrocery(item) {
 }
 
 async function addLiveGrocery(label, qty) {
-  const tokenPromise = ensureToken(true);
+  if (!hasFreshToken()) throw new Error('no live token');
   const configured = CONFIG.sheetRange || 'Groceries!A2:C200';
   const range = sheetPrefixFor(CONFIG.sheetId, configured) + (configured.includes('!') ? configured.split('!').slice(1).join('!') : configured);
-  if (!await tokenPromise) throw new Error('Could not reach Google — tap the refresh button and try again.');
   await gfetch(`https://sheets.googleapis.com/v4/spreadsheets/${CONFIG.sheetId}/values/${encodeURIComponent(range)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -2207,180 +2176,18 @@ document.getElementById('groceryAddForm').addEventListener('submit', async event
     itemInput.focus();
   } catch (err) {
     console.error('Grocery add failed', err);
-    document.getElementById('groceryFootnote').textContent = 'Could not add that item. Check the Sheet permissions and try again.';
+    document.getElementById('groceryFootnote').textContent = 'Could not add that item. Press ⟳ to reconnect, then try again.';
   } finally {
     button.disabled = false;
   }
 });
 
-/* ---- Google Photos Ambient: separate device OAuth flow. Google requires a
-   TVs and Limited Input devices OAuth client for ambient displays. ---- */
-let ambientAccessToken = null;
-let ambientAccessTokenExpiresAt = 0;
-let ambientPhotoUrls = [];
-let ambientClientSecret = '';
-let ambientRefreshToken = null;
-
-function setAmbientStatus(html) {
-  document.getElementById('ambientStatus').innerHTML = html;
-}
-
-function renderAmbientStatus() {
-  if (CONFIG.ambientDeviceId) {
-    const sources = (CONFIG.ambientMediaSources || []).map(s => escapeHtml(s.displayName)).join(', ');
-    const settingsLink = CONFIG.ambientSettingsUri
-      ? ` <a href="${escapeHtml(CONFIG.ambientSettingsUri)}" target="_blank" rel="noopener">Change albums</a>.`
-      : '';
-    const sessionNote = ambientRefreshToken ? 'Connected for this session' : 'Device configured; reconnect after this page reload';
-    setAmbientStatus(`${sessionNote}${sources ? `: ${sources}` : ''}.${settingsLink}`);
-  } else {
-    setAmbientStatus('Google Photos is not connected yet.');
-  }
-}
-
-async function postOAuthForm(url, values) {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams(values),
-  });
-  const data = await response.json().catch(() => ({}));
-  return { response, data };
-}
-
-async function ensureAmbientToken() {
-  if (ambientAccessToken && Date.now() < ambientAccessTokenExpiresAt - 60000) return ambientAccessToken;
-  if (!ambientRefreshToken) throw new Error('Google Photos is not connected for this page session.');
-  const { response, data } = await postOAuthForm('https://oauth2.googleapis.com/token', {
-    client_id: CONFIG.ambientClientId,
-    refresh_token: ambientRefreshToken,
-    grant_type: 'refresh_token',
-  });
-  if (!response.ok) throw new Error(data.error_description || data.error || 'Could not refresh Google Photos access.');
-  ambientAccessToken = data.access_token;
-  ambientAccessTokenExpiresAt = Date.now() + (data.expires_in || 3600) * 1000;
-  return ambientAccessToken;
-}
-
-async function ambientFetch(url, options = {}) {
-  const token = await ensureAmbientToken();
-  const response = await fetch(url, {
-    ...options,
-    headers: { ...(options.headers || {}), Authorization: `Bearer ${token}` },
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(`${response.status} ${response.statusText}: ${body.slice(0, 250)}`);
-  }
-  return response.status === 204 ? null : response.json();
-}
-
-async function connectGooglePhotos() {
-  if (!CONFIG.ambientClientId) {
-    setAmbientStatus('Google Photos is not configured for this deployment.');
-    return;
-  }
-  ambientClientSecret = (window.prompt('Enter the Google Photos TV client secret. It will be kept only for this page session.') || '').trim();
-  if (!ambientClientSecret) return;
-  setAmbientStatus('Starting Google Photos device connection…');
-  const { response, data } = await postOAuthForm('https://oauth2.googleapis.com/device/code', {
-    client_id: CONFIG.ambientClientId,
-    scope: 'profile https://www.googleapis.com/auth/photosambient.mediaitems',
-  });
-  if (!response.ok) throw new Error(data.error_description || data.error || 'Could not start device connection.');
-
-  setAmbientStatus(`Open <a href="${escapeHtml(data.verification_url)}" target="_blank" rel="noopener">${escapeHtml(data.verification_url)}</a> and enter code <strong>${escapeHtml(data.user_code)}</strong>. Waiting for authorization…`);
-  const deadline = Date.now() + data.expires_in * 1000;
-  let intervalMs = Math.max(5, data.interval || 5) * 1000;
-  let tokenData = null;
-  while (Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, intervalMs));
-    const poll = await postOAuthForm('https://oauth2.googleapis.com/token', {
-      client_id: CONFIG.ambientClientId,
-      client_secret: ambientClientSecret,
-      device_code: data.device_code,
-      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-    });
-    if (poll.response.ok) { tokenData = poll.data; break; }
-    if (poll.data.error === 'slow_down') { intervalMs += 5000; continue; }
-    if (poll.data.error === 'authorization_pending') continue;
-    throw new Error(poll.data.error_description || poll.data.error || 'Google Photos authorization failed.');
-  }
-  if (!tokenData) throw new Error('Google Photos authorization timed out. Try Connect again.');
-
-  ambientAccessToken = tokenData.access_token;
-  ambientAccessTokenExpiresAt = Date.now() + (tokenData.expires_in || 3600) * 1000;
-  ambientRefreshToken = tokenData.refresh_token;
-  let device = null;
-  if (CONFIG.ambientDeviceId) {
-    try {
-      device = await ambientFetch(`https://photosambient.googleapis.com/v1/devices/${encodeURIComponent(CONFIG.ambientDeviceId)}`);
-    } catch (err) {
-      console.warn('Existing Ambient device was unavailable; creating a new one.', err);
-    }
-  }
-  if (!device) {
-    const requestId = crypto.randomUUID();
-    device = await ambientFetch(`https://photosambient.googleapis.com/v1/devices?requestId=${encodeURIComponent(requestId)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ displayName: 'Family Board' }),
-    });
-  }
-  CONFIG.ambientDeviceId = device.id;
-  CONFIG.ambientSettingsUri = device.settingsUri;
-  CONFIG.ambientMediaSources = device.mediaSources || [];
-  saveConfig(CONFIG);
-  setAmbientStatus(`Account connected. Now <a href="${escapeHtml(device.settingsUri)}" target="_blank" rel="noopener">choose the Google Photos album(s)</a>, then click “Refresh photos.”`);
-}
-
-async function fetchAmbientPhotoBlobUrl(baseUrl) {
-  const token = await ensureAmbientToken();
-  const response = await fetch(`${baseUrl}=w1600-h1000`, { headers: { Authorization: `Bearer ${token}` } });
-  if (!response.ok) throw new Error(`Photo download failed: ${response.status}`);
-  return URL.createObjectURL(await response.blob());
-}
-
-async function loadAmbientPhotos() {
-  if (!CONFIG.ambientDeviceId) { renderAmbientStatus(); return; }
-  setAmbientStatus('Loading selected Google Photos…');
-  const device = await ambientFetch(`https://photosambient.googleapis.com/v1/devices/${encodeURIComponent(CONFIG.ambientDeviceId)}`);
-  CONFIG.ambientSettingsUri = device.settingsUri;
-  CONFIG.ambientMediaSources = device.mediaSources || [];
-  saveConfig(CONFIG);
-  if (!device.mediaSourcesSet) {
-    setAmbientStatus(`Choose at least one album in <a href="${escapeHtml(device.settingsUri)}" target="_blank" rel="noopener">Google Photos settings</a>, then click “Refresh photos.”`);
-    return;
-  }
-  const data = await ambientFetch(`https://photosambient.googleapis.com/v1/mediaItems?deviceId=${encodeURIComponent(device.id)}&pageSize=30`);
-  const items = (data.mediaItems || []).filter(item => item.mediaFile && item.mediaFile.baseUrl).slice(0, 30);
-  const urls = [];
-  for (let i = 0; i < items.length; i += 5) {
-    const batch = await Promise.allSettled(items.slice(i, i + 5).map(item => fetchAmbientPhotoBlobUrl(item.mediaFile.baseUrl)));
-    batch.forEach(result => { if (result.status === 'fulfilled') urls.push(result.value); });
-  }
-  if (!urls.length) throw new Error('No displayable photos were returned from the selected albums.');
-  ambientPhotoUrls.forEach(url => URL.revokeObjectURL(url));
-  ambientPhotoUrls = urls;
-  buildPhotoFrame(ambientPhotoUrls);
-  photoIndex = 0;
-  renderAmbientStatus();
-}
-
-document.getElementById('connectPhotosBtn').addEventListener('click', () => {
-  connectGooglePhotos().catch(err => {
-    console.error('Google Photos connect failed', err);
-    setAmbientStatus(`Could not connect Google Photos: ${escapeHtml(err.message)}`);
-  });
-});
-document.getElementById('refreshPhotosBtn').addEventListener('click', () => {
-  loadAmbientPhotos().catch(err => {
-    console.error('Google Photos refresh failed', err);
-    setAmbientStatus(`Could not load photos: ${escapeHtml(err.message)}`);
-  });
-});
-
-// Live data refreshes are governed by the DATA CACHE section above.
+/* The sleep screen's photos come from MOCK_PHOTOS. There used to be a Google
+   Photos connection here — a device OAuth flow against the Ambient API — but
+   that API is gated behind Google's partner program, so it could never have
+   worked for this board and it is gone. The Library API only sees photos the
+   app itself created, and the Picker API needs someone to re-pick every seven
+   days. A Drive folder read is the route if this is ever wanted. */
 
 /* =========================================================================
    RENDER: CALENDAR (uses liveEvents if connected, else DEMO_EVENTS)
@@ -2390,7 +2197,11 @@ function checkSVG() {
 }
 
 function currentEvents() { return isConnected && liveEvents ? liveEvents : DEMO_EVENTS; }
-function currentTasks() { return isConnected && liveTasks ? liveTasks : DEMO_TASKS; }
+function currentTasks() {
+  if (!isConnected || !liveTasks) return DEMO_TASKS;
+  const today = dayKey();
+  return liveTasks.filter(t => !t.due || t.due.slice(0, 10) <= today);
+}
 function currentGroceries() { return isConnected && liveGroceries ? liveGroceries : DEMO_GROCERIES; }
 function currentMorningMenus() {
   if (isConnected) return liveMorningMenus;
@@ -2741,8 +2552,6 @@ const drawn64 = fn => k => `<svg class="kid-avatar" viewBox="0 0 64 64" aria-hid
 
 AVATAR_STYLES.pixel = drawn64(AVATAR_STYLES.pixel);
 AVATAR_STYLES.monogram = drawn64(AVATAR_STYLES.monogram);
-
-const AVATAR_STYLE_NAMES = { anime: 'Anime', animal: 'Animal', pixel: 'Pixel', monogram: 'Monogram' };
 
 function kidAvatar(kid) {
   const picked = typeof customAvatars !== 'undefined' && customAvatars[kid.id];
@@ -3170,7 +2979,7 @@ setInterval(tick, 1000);
   function refreshEverything() {
     tick();                 // header clock, date line, ambient wash, dial + ring
     renderWeather();        // strip + weather backdrop
-    if (isConnected && hasFreshToken()) fetchMorningMenu(); else renderMorningMenu(); // lunch is a per-weekday row
+    renderMorningMenu();    // the whole week is cached; a day jump is a re-render
     checklist = loadChecklist();
     renderChecklists();
     renderAfterSchool();
@@ -3295,8 +3104,10 @@ resetIdleTimer();
    ========================================================================= */
 document.getElementById('fullscreenBtn').addEventListener('click', () => {
   if (!document.fullscreenElement) {
+    setKioskMode(true);   // and stay that way, through reloads and restarts
     document.documentElement.requestFullscreen().catch(() => {});
   } else {
+    setKioskMode(false);
     document.exitFullscreen();
   }
 });

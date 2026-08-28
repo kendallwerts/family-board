@@ -167,6 +167,9 @@
   .calendar-choice .swatch { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
   .calendar-group-title { margin: 7px 0 1px; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-soft); }
   .calendar-group-title:first-child { margin-top: 0; }
+  .photo-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .photo-status { margin-top: 9px; padding: 10px 12px; border-radius: 10px; background: var(--paper); font-size: 0.78rem; line-height: 1.5; }
+  .photo-status:empty { display: none; }
 
   /* ================= MORNINGS ================= */
   .morning-layout { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(280px, 1fr) minmax(330px, 1.02fr); gap: 22px; }
@@ -913,6 +916,17 @@
     </div>
 
     <div class="field">
+      <label>Sleep screen photos</label>
+      <div class="hint">Pick them from this device — Google Photos shows up as a source in the picker. They are copied onto this tablet and shown while the board sleeps, with no network and no sign-in.</div>
+      <div class="photo-actions">
+        <button class="btn-secondary" type="button" id="addPhotosBtn">Add photos</button>
+        <button class="btn-secondary" type="button" id="clearPhotosBtn">Remove all</button>
+      </div>
+      <input type="file" id="photoInput" accept="image/*" multiple hidden>
+      <div class="photo-status" id="photoStatus"></div>
+    </div>
+
+    <div class="field">
       <label for="menuSheetInput">Menu spreadsheet ID</label>
       <input type="text" id="menuSheetInput" placeholder="1AbC…" autocomplete="off" spellcheck="false">
       <div class="hint">From the sheet's URL, the part between <code>/d/</code> and <code>/edit</code>. Needs a tab named <code>Mornings</code>: weekday, main, veggie, fruit, extra — one row per day from row 2.</div>
@@ -1466,6 +1480,7 @@ function openSettings() {
     ? 'Disconnect Google account'
     : 'Connect Google account';
   renderCalendarPicker();
+  renderPhotoStatus();
   document.getElementById('dataAgeHint').textContent = isConnected
     ? `${dataAgeLabel()} The board holds a week and only asks Google when you press ⟳. Build ${BOARD_BUILD}.`
     : `Build ${BOARD_BUILD}.`;
@@ -1850,7 +1865,7 @@ async function fetchAllData() {
    screen. So the board asks once, deliberately, with a person standing in
    front of it, and never at six in the morning with only the kids there.
    ========================================================================= */
-const BOARD_BUILD = '2026-08-27b';   // shown in Settings; bump when shipping
+const BOARD_BUILD = '2026-08-27c';   // shown in Settings; bump when shipping
 const DATA_KEY = 'homeboard_data_v1';
 let dataSavedAt = 0;
 let dataDayKey = '';
@@ -3056,34 +3071,218 @@ let idleTimer = null;
 let slideTimer = null;
 let photoIndex = 0;
 
-function buildPhotoFrame(photoUrls) {
-  photoFrame.innerHTML = '';
-  photoUrls.forEach(src => {
-    const img = document.createElement('img');
-    img.src = src;
-    img.alt = '';
-    photoFrame.appendChild(img);
+/* ---- The photo store ----------------------------------------------------
+   Photos are picked with a plain file input. On Android that opens the system
+   picker, and Google Photos is one of the sources — so the pictures come from
+   the phone's library exactly as if they had been chosen in the app, but they
+   arrive as files handed to the page. No API, no sign-in, no session to
+   expire. (Google's own Photos APIs are all dead ends here: Ambient needs
+   their partner program, Library only sees photos the app itself created, and
+   Picker sessions die after seven days.)
+
+   They live in IndexedDB, not localStorage — localStorage holds about 5MB and
+   stores text, which would mean base64 and a third more bulk again.
+
+   They live on THIS device only. Adding them on a laptop puts nothing on the
+   wall board. ------------------------------------------------------------ */
+const PHOTO_DB = 'homeboard-photos';
+const PHOTO_STORE = 'photos';
+
+function openPhotoDb() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(PHOTO_DB, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(PHOTO_STORE)) {
+        request.result.createObjectStore(PHOTO_STORE, { autoIncrement: true });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
   });
 }
-buildPhotoFrame(MOCK_PHOTOS);
 
-function showPhoto(i) {
-  const imgs = photoFrame.querySelectorAll('img');
-  imgs.forEach((img, idx) => img.classList.toggle('showing', idx === i));
+function photoStoreRequest(mode, run) {
+  return openPhotoDb().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(PHOTO_STORE, mode);
+    const request = run(tx.objectStore(PHOTO_STORE));
+    tx.oncomplete = () => { db.close(); resolve(request && request.result); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  }));
 }
+
+const savedPhotoBlobs = () => photoStoreRequest('readonly', store => store.getAll());
+const savePhotoBlob = blob => photoStoreRequest('readwrite', store => store.add(blob));
+const clearSavedPhotos = () => photoStoreRequest('readwrite', store => store.clear());
+
+/* ---- Shrinking ----------------------------------------------------------
+   Not for disk. A phone photo is about 4MB and the tablet has room for
+   hundreds. It is for memory: 12 megapixels decodes to roughly 48MB of RAM,
+   and this is an old Android. The board is 1920px wide at most, so anything
+   past 2048 on the long edge is detail nobody can see. Shrinking turns 4MB
+   into about 350KB and makes the fade smooth instead of a stutter. The
+   originals are still in Google Photos; this only touches the copy. */
+const PHOTO_MAX_EDGE = 2048;
+const PHOTO_QUALITY = 0.85;
+
+function canvasToBlob(canvas) {
+  return new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', PHOTO_QUALITY));
+}
+
+/* createImageBitmap decodes off the main thread and honours EXIF rotation, so
+   portrait shots do not come out sideways. Older engines get the img route. */
+async function decodeImage(file) {
+  if (window.createImageBitmap) {
+    try { return await createImageBitmap(file, { imageOrientation: 'from-image' }); }
+    catch (e) { /* fall through — HEIC and a few others land here */ }
+  }
+  const url = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = () => reject(new Error('could not decode'));
+      img.src = url;
+    });
+    return img;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function shrinkPhoto(file) {
+  const source = await decodeImage(file);
+  const width = source.width || source.naturalWidth;
+  const height = source.height || source.naturalHeight;
+  if (!width || !height) throw new Error('empty image');
+  const scale = Math.min(1, PHOTO_MAX_EDGE / Math.max(width, height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(width * scale);
+  canvas.height = Math.round(height * scale);
+  canvas.getContext('2d').drawImage(source, 0, 0, canvas.width, canvas.height);
+  if (source.close) source.close();
+  const blob = await canvasToBlob(canvas);
+  if (!blob) throw new Error('could not re-encode');
+  return blob;
+}
+
+/* ---- What the slideshow is currently showing ---------------------------- */
+let photoSources = [];
+let photoObjectUrls = [];
+let photoLayers = [];
+let activeLayer = 0;
+
+function buildPhotoFrame() {
+  photoFrame.innerHTML = '';
+  photoLayers = [0, 1].map(() => {
+    const img = document.createElement('img');
+    img.alt = '';
+    photoFrame.appendChild(img);
+    return img;
+  });
+  activeLayer = 0;
+}
+
+/* Two layers, cross-faded, however many photos there are. The old version put
+   every photo in the DOM at once, which was fine for four stock pictures and
+   would not be for eighty of the family. */
+function showPhoto(i) {
+  if (!photoSources.length) return;
+  const incoming = photoLayers[1 - activeLayer];
+  const outgoing = photoLayers[activeLayer];
+  incoming.src = photoSources[i % photoSources.length];
+  const reveal = () => {
+    incoming.classList.add('showing');
+    outgoing.classList.remove('showing');
+    activeLayer = 1 - activeLayer;
+  };
+  // Fade in only once it has decoded, or the first frame is a blank panel.
+  if (incoming.decode) incoming.decode().then(reveal).catch(reveal);
+  else incoming.onload = reveal;
+}
+
+async function loadPhotoSources() {
+  photoObjectUrls.forEach(url => URL.revokeObjectURL(url));
+  photoObjectUrls = [];
+  let blobs = [];
+  try { blobs = await savedPhotoBlobs() || []; } catch (e) { console.error('Photo store unreadable', e); }
+  if (blobs.length) {
+    photoObjectUrls = blobs.map(blob => URL.createObjectURL(blob));
+    photoSources = photoObjectUrls;
+  } else {
+    photoSources = MOCK_PHOTOS;   // the stock pictures, until the family's arrive
+  }
+  photoIndex = 0;
+  buildPhotoFrame();
+  if (idleEl.classList.contains('active')) { stopSlideshow(); startSlideshow(); }
+}
+
 function startSlideshow() {
-  const count = photoFrame.querySelectorAll('img').length;
-  if (!count) return;
-  photoIndex %= count;
+  if (!photoSources.length) return;
+  photoIndex %= photoSources.length;
   showPhoto(photoIndex);
   slideTimer = setInterval(() => {
-    const currentCount = photoFrame.querySelectorAll('img').length;
-    if (!currentCount) return;
-    photoIndex = (photoIndex + 1) % currentCount;
+    if (!photoSources.length) return;
+    photoIndex = (photoIndex + 1) % photoSources.length;
     showPhoto(photoIndex);
   }, 8000);
 }
 function stopSlideshow() { clearInterval(slideTimer); }
+
+/* ---- Settings: add, count, remove --------------------------------------- */
+function setPhotoStatus(text) {
+  document.getElementById('photoStatus').textContent = text;
+}
+
+async function renderPhotoStatus() {
+  let count = 0;
+  try { count = (await savedPhotoBlobs() || []).length; } catch (e) { /* unreadable */ }
+  setPhotoStatus(count
+    ? `${count} photo${count === 1 ? '' : 's'} on this device.`
+    : 'No photos yet — the board is showing its stock pictures.');
+}
+
+async function importPhotos(files) {
+  const list = Array.from(files);
+  if (!list.length) return;
+  const addBtn = document.getElementById('addPhotosBtn');
+  addBtn.disabled = true;
+  let added = 0;
+  let skipped = 0;
+  for (let i = 0; i < list.length; i++) {
+    setPhotoStatus(`Adding ${i + 1} of ${list.length}…`);
+    try {
+      await savePhotoBlob(await shrinkPhoto(list[i]));
+      added += 1;
+    } catch (err) {
+      skipped += 1;   // usually a format this browser cannot decode, like HEIC
+      console.error('Could not add photo', list[i] && list[i].name, err);
+    }
+  }
+  addBtn.disabled = false;
+  await loadPhotoSources();
+  await renderPhotoStatus();
+  if (skipped) {
+    setPhotoStatus(`${document.getElementById('photoStatus').textContent} ${skipped} could not be read — that format is not supported here.`);
+  } else if (added) {
+    setPhotoStatus(`Added ${added}. ${document.getElementById('photoStatus').textContent}`);
+  }
+}
+
+document.getElementById('addPhotosBtn').addEventListener('click', () => {
+  document.getElementById('photoInput').click();
+});
+document.getElementById('photoInput').addEventListener('change', event => {
+  const input = event.target;
+  importPhotos(input.files).finally(() => { input.value = ''; });  // so the same pick can be redone
+});
+document.getElementById('clearPhotosBtn').addEventListener('click', async () => {
+  try { await clearSavedPhotos(); } catch (e) { console.error('Could not clear photos', e); }
+  await loadPhotoSources();
+  await renderPhotoStatus();
+});
+
+buildPhotoFrame();
+loadPhotoSources();
 function enterIdle() { idleEl.classList.add('active'); startSlideshow(); }
 function exitIdle() { idleEl.classList.remove('active'); stopSlideshow(); }
 function resetIdleTimer() {

@@ -57,10 +57,13 @@
     display: flex; align-items: center; justify-content: center;
     border: 1px solid var(--line); background: var(--paper); color: var(--ink-soft);
     border-radius: 15px; cursor: pointer;
-    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.08s ease;
   }
   .icon-btn svg { width: 22px; height: 22px; }
   .icon-btn:hover { background: #fff; color: var(--ink); border-color: #c7cdc4; }
+  .icon-btn:active { transform: scale(0.94); background: #fff; }
+  .icon-btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
   .icon-btn:focus-visible { outline: 2px solid var(--dusk); outline-offset: 2px; }
   .icon-btn .dot { position: absolute; top: 6px; right: 6px; width: 9px; height: 9px; border-radius: 50%; background: var(--ink-soft); border: 2px solid var(--paper); }
   .icon-btn.is-connected { background: #EAF1E9; border-color: var(--sage); color: #3f5a3f; }
@@ -511,12 +514,24 @@
   .field input:focus { outline: 2px solid var(--dusk); outline-offset: 1px; }
   .field .hint { font-size: 0.72rem; color: var(--ink-soft); margin-top: 5px; line-height: 1.4; }
   .settings-actions { display: flex; gap: 10px; margin-top: 6px; }
+  /* A touchscreen has no hover, so a button that only changes on hover gives
+     nothing back at all: no way to tell a press landed, or that a button is
+     busy, or that it is disabled. Every button gets a pressed state, a
+     disabled state, and no tap-highlight box of the browser's own. */
   .btn-primary, .btn-secondary {
     flex: 1; padding: 12px; border-radius: 10px; border: none; cursor: pointer;
     font-family: 'Inter', sans-serif; font-weight: 600; font-size: 0.88rem;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+    transition: transform 0.08s ease, filter 0.15s ease, opacity 0.15s ease;
   }
   .btn-primary { background: var(--ink); color: #fff; }
   .btn-secondary { background: var(--paper); color: var(--ink); border: 1px solid var(--line); }
+  .btn-primary:active, .btn-secondary:active { transform: scale(0.97); filter: brightness(0.93); }
+  .btn-primary:focus-visible, .btn-secondary:focus-visible { outline: 2px solid var(--dusk); outline-offset: 2px; }
+  .btn-primary:disabled, .btn-secondary:disabled {
+    opacity: 0.45; cursor: not-allowed; transform: none; filter: none;
+  }
+  .btn-secondary.is-armed { border-color: var(--clay); color: var(--clay); background: #fff; }
   /* ---- completion confetti ---- */
   #confetti { position: fixed; inset: 0; z-index: 200; display: none; overflow: hidden; pointer-events: none; }
   #confetti.active { display: block; }
@@ -583,10 +598,13 @@
     font-family: 'Inter', sans-serif; font-size: 0.75rem; font-weight: 600; letter-spacing: 0.02em;
     border: 1px solid var(--line); background: var(--paper); color: var(--ink-soft);
     padding: 8px 14px; border-radius: 100px; cursor: pointer; white-space: nowrap;
-    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.08s ease;
   }
   .pill-btn:hover { background: #fff; color: var(--ink); border-color: #c7cdc4; }
+  .pill-btn:active { transform: scale(0.96); filter: brightness(0.94); }
   .pill-btn:focus-visible { outline: 2px solid var(--dusk); outline-offset: 2px; }
+  .pill-btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
   .settings-close { position: absolute; top: 14px; right: 16px; }
   /* ================= TEST PANEL (temporary) =================
      Delete this block, the #testPanel markup, and the TEST PANEL script
@@ -940,6 +958,12 @@
       <label for="grocerySheetInput">Grocery spreadsheet ID</label>
       <input type="text" id="grocerySheetInput" placeholder="1AbC…" autocomplete="off" spellcheck="false">
       <div class="hint">Can be the same spreadsheet, as long as it also has a tab named <code>Groceries</code>: item, qty, done.</div>
+    </div>
+
+    <div class="field">
+      <label for="idleMinutesInput">Photos take over after</label>
+      <input type="number" id="idleMinutesInput" min="1" max="240" step="1">
+      <div class="hint">Minutes of nobody touching the board before the sleep screen and its photos come up. Tap the screen to bring the board back. Per device.</div>
     </div>
 
     <div class="field">
@@ -1489,6 +1513,7 @@ function openSettings() {
     ? `${dataAgeLabel()} The board holds a week and only asks Google when you press ⟳. Build ${BOARD_BUILD}.`
     : `Build ${BOARD_BUILD}.`;
   document.getElementById('morningStartInput').value = CONFIG.morningStart || DEFAULT_MORNING_START;
+  document.getElementById('idleMinutesInput').value = idleMinutes();
   document.getElementById('menuSheetInput').value = CONFIG.menuSheetId || '';
   document.getElementById('grocerySheetInput').value = CONFIG.sheetId || '';
   overlay.classList.add('active');
@@ -1537,10 +1562,12 @@ document.getElementById('saveSettingsBtn').addEventListener('click', () => {
     CONFIG.calendarIds = Array.from(document.querySelectorAll('#calendarPicker input:checked')).map(input => input.value);
   }
   CONFIG.morningStart = document.getElementById('morningStartInput').value || DEFAULT_MORNING_START;
+  CONFIG.idleMinutes = Math.min(240, Math.max(1, Number(document.getElementById('idleMinutesInput').value) || DEFAULT_IDLE_MINUTES));
   CONFIG.menuSheetId = document.getElementById('menuSheetInput').value.trim();
   CONFIG.sheetId = document.getElementById('grocerySheetInput').value.trim();
   saveConfig(CONFIG);
   updateMorningClock();
+  noteActivity();   // the new delay starts from now, not from whenever you last touched it
   if (isConnected) refreshData();   // a press, so a token is fine
   closeSettings();
 });
@@ -1869,7 +1896,7 @@ async function fetchAllData() {
    screen. So the board asks once, deliberately, with a person standing in
    front of it, and never at six in the morning with only the kids there.
    ========================================================================= */
-const BOARD_BUILD = '2026-08-28a';   // shown in Settings; bump when shipping
+const BOARD_BUILD = '2026-08-28b';   // shown in Settings; bump when shipping
 const DATA_KEY = 'homeboard_data_v1';
 let dataSavedAt = 0;
 let dataDayKey = '';
@@ -3071,7 +3098,6 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
    ========================================================================= */
 const idleEl = document.getElementById('idle');
 const photoFrame = document.getElementById('photoFrame');
-let idleTimer = null;
 let slideTimer = null;
 let photoIndex = 0;
 
@@ -3323,6 +3349,8 @@ function setPhotoStatus(text) {
 async function renderPhotoStatus() {
   let count = 0;
   try { count = (await savedPhotoBlobs() || []).length; } catch (e) { /* unreadable */ }
+  disarmClearPhotos();
+  document.getElementById('clearPhotosBtn').disabled = count === 0;
   setPhotoStatus(count
     ? `${count} photo${count === 1 ? '' : 's'} on this device.`
     : 'No photos yet — the board is showing its stock pictures.');
@@ -3332,7 +3360,10 @@ async function importPhotos(files) {
   const picked = Array.from(files);
   if (!picked.length) return;
   const addBtn = document.getElementById('addPhotosBtn');
-  addBtn.disabled = true;
+  const clearBtn = document.getElementById('clearPhotosBtn');
+  const addLabel = addBtn.textContent;
+  addBtn.disabled = clearBtn.disabled = true;
+  addBtn.textContent = 'Adding…';
   setPhotoStatus('Reading…');
   const { files: list, badZips } = await expandPicked(picked);
   let added = 0;
@@ -3348,6 +3379,7 @@ async function importPhotos(files) {
     }
   }
   addBtn.disabled = false;
+  addBtn.textContent = addLabel;
   await loadPhotoSources();
   await renderPhotoStatus();
   const count = document.getElementById('photoStatus').textContent;
@@ -3362,7 +3394,29 @@ document.getElementById('photoInput').addEventListener('change', event => {
   const input = event.target;
   importPhotos(input.files).finally(() => { input.value = ''; });  // so the same pick can be redone
 });
-document.getElementById('clearPhotosBtn').addEventListener('click', async () => {
+/* One tap arms it, the second does it. There is no undo, and the button sits
+   next to the one people actually mean to press. */
+let clearPhotosArmed = false;
+let clearPhotosTimer = null;
+
+function disarmClearPhotos() {
+  clearPhotosArmed = false;
+  clearTimeout(clearPhotosTimer);
+  const btn = document.getElementById('clearPhotosBtn');
+  btn.textContent = 'Remove all';
+  btn.classList.remove('is-armed');
+}
+
+document.getElementById('clearPhotosBtn').addEventListener('click', async event => {
+  const btn = event.currentTarget;
+  if (!clearPhotosArmed) {
+    clearPhotosArmed = true;
+    btn.textContent = 'Tap again to remove';
+    btn.classList.add('is-armed');
+    clearPhotosTimer = setTimeout(disarmClearPhotos, 5000);
+    return;
+  }
+  disarmClearPhotos();
   try { await clearSavedPhotos(); } catch (e) { console.error('Could not clear photos', e); }
   await loadPhotoSources();
   await renderPhotoStatus();
@@ -3372,17 +3426,54 @@ buildPhotoFrame();
 loadPhotoSources();
 function enterIdle() { idleEl.classList.add('active'); startSlideshow(); }
 function exitIdle() { idleEl.classList.remove('active'); stopSlideshow(); }
-function resetIdleTimer() {
-  if (idleEl.classList.contains('active')) exitIdle();
-  clearTimeout(idleTimer);
-  const idleAfterMs = Math.max(1, Number(CONFIG.idleMinutes) || 5) * 60 * 1000;
-  idleTimer = setTimeout(enterIdle, idleAfterMs);
+
+/* This used to be one long setTimeout, and on the tablet the photos took far
+   longer than the five minutes it was set to. A single long timer is the wrong
+   tool: mobile browsers coalesce and throttle them, and a tab that loses focus
+   or a screen that switches off can park one indefinitely.
+
+   So the board stores when it was last touched and compares against the clock
+   once a second, off the tick that is already running. Wall time cannot be
+   throttled. */
+const DEFAULT_IDLE_MINUTES = 5;
+let lastActivityAt = Date.now();
+
+function idleMinutes() {
+  return Math.min(240, Math.max(1, Number(CONFIG.idleMinutes) || DEFAULT_IDLE_MINUTES));
 }
-['mousemove', 'mousedown', 'touchstart', 'keydown'].forEach(evt =>
-  document.addEventListener(evt, resetIdleTimer, { passive: true })
+
+function noteActivity() {
+  lastActivityAt = Date.now();
+  if (idleEl.classList.contains('active')) exitIdle();
+}
+
+function checkIdle() {
+  if (idleEl.classList.contains('active')) return;
+  if (Date.now() - lastActivityAt >= idleMinutes() * 60 * 1000) enterIdle();
+}
+
+/* A mousemove that has not moved is not a person. Some mobile browsers fire
+   them on scroll and on layout changes, and each one used to restart the wait,
+   which is the other half of why the photos never came up. */
+let lastPointerSpot = null;
+document.addEventListener('mousemove', event => {
+  const spot = `${event.clientX},${event.clientY}`;
+  if (spot === lastPointerSpot) return;
+  lastPointerSpot = spot;
+  noteActivity();
+}, { passive: true });
+
+['pointerdown', 'touchstart', 'keydown', 'wheel'].forEach(evt =>
+  document.addEventListener(evt, noteActivity, { passive: true })
 );
 idleEl.addEventListener('click', exitIdle);
-resetIdleTimer();
+
+/* Its own interval, and deliberately not a call inside tick(): tick runs once
+   during start-up, before this section's consts exist, and reaching them from
+   there is a dead-zone crash that takes the rest of the script with it.
+   A one-second beat that fires late is harmless — the comparison is against
+   wall time, so a throttled tab simply sleeps the moment it catches up. */
+setInterval(checkIdle, 1000);
 
 
 /* =========================================================================

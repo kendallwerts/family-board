@@ -384,7 +384,22 @@
   .kid-tile.is-done { background: var(--kid-color); border-color: var(--kid-color); color: #fff; }
 
   .after-school { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
-  .as-list { list-style: none; margin: 0; padding: 0; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+  .as-list { list-style: none; margin: 0 0 10px; padding: 0; min-height: 0; max-height: 42%; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+  .after-task-board { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .after-task-kid { min-width: 0; min-height: 0; display: flex; flex-direction: column; border: 1px solid var(--line); border-top: 4px solid var(--kid-color); border-radius: 14px; background: #fff; overflow: hidden; }
+  .after-task-head { padding: 8px 10px 6px; font-family: 'Fraunces', serif; font-size: 1rem; font-weight: 600; }
+  .after-task-list { flex: 1; min-height: 0; overflow-y: auto; list-style: none; margin: 0; padding: 0 9px; }
+  .after-task-row { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 7px 1px; border-bottom: 1px solid var(--line); }
+  .after-task-row:last-child { border-bottom: none; }
+  .after-task-row .check { width: 22px; height: 22px; margin: 0; }
+  .after-task-row.is-done .check { background: var(--sage); border-color: var(--sage); }
+  .after-task-row.is-done .check svg { display: block; }
+  .after-task-label { flex: 1; min-width: 0; font-size: 0.84rem; font-weight: 600; line-height: 1.2; overflow-wrap: anywhere; }
+  .after-task-row.is-done .after-task-label { color: var(--ink-soft); text-decoration: line-through; }
+  .after-task-add { display: flex; gap: 6px; padding: 7px 8px 8px; border-top: 1px solid var(--line); }
+  .after-task-add input { flex: 1; min-width: 0; padding: 8px 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--paper-panel); font: inherit; font-size: 0.78rem; }
+  .after-task-add button { flex: 0 0 34px; border: 0; border-radius: 9px; background: var(--kid-color); color: #fff; font-size: 1.15rem; font-weight: 700; cursor: pointer; }
+  .after-task-empty { padding: 8px 2px; color: var(--ink-soft); font-size: 0.76rem; font-style: italic; }
   .as-item { display: flex; align-items: flex-start; gap: 11px; min-width: 0; padding: 10px 12px; border-radius: 14px; background: #fff; border: 1px solid var(--line); border-left: 4px solid var(--as-color, var(--dusk)); }
   .as-icon {
     flex-shrink: 0; width: 42px; height: 42px; display: flex; align-items: center; justify-content: center;
@@ -656,10 +671,8 @@
     <section class="panel">
       <div class="tab-row">
         <div class="tab-switch">
+          <button class="tab-btn active" data-tab="daily">Daily</button>
           <button class="tab-btn" data-tab="calendar">Calendar</button>
-          <button class="tab-btn" data-tab="tasks">Tasks</button>
-          <button class="tab-btn" data-tab="grocery">Grocery</button>
-          <button class="tab-btn active" data-tab="mornings">Mornings</button>
         </div>
         <div class="tab-actions">
           <button class="icon-btn" id="refreshBtn" title="Refresh from Google" aria-label="Refresh from Google">
@@ -701,7 +714,7 @@
           <div class="panel-footnote" id="groceryFootnote">Backed by a shared Sheet — add items from your phone, they show up here.</div>
         </div>
 
-        <div class="tab-panel active" id="tab-mornings">
+        <div class="tab-panel active" id="tab-daily">
           <div class="morning-layout">
             <div class="morning-clock-side">
               <div class="now-strip">
@@ -834,6 +847,7 @@
               <div class="after-school">
                 <h2 class="side-title">After School <span class="side-title-note" id="afterSchoolDay">Today</span></h2>
                 <ul class="as-list" id="afterSchoolList"></ul>
+                <div class="after-task-board" id="afterTaskBoard" aria-label="After-school tasks"></div>
               </div>
             </div>
           </div>
@@ -1006,8 +1020,7 @@ let CONFIG = { ...loadConfig(), ...suppliedDeployedConfig };
 
 const SCOPES = [
   'https://www.googleapis.com/auth/calendar.readonly',
-  'https://www.googleapis.com/auth/tasks',
-  'https://www.googleapis.com/auth/spreadsheets',
+  'https://www.googleapis.com/auth/spreadsheets.readonly',
 ].join(' ');
 
 /* =========================================================================
@@ -1874,7 +1887,7 @@ let fetchErrorCount = 0;
 
 async function fetchAllData() {
   fetchErrorCount = 0;
-  await Promise.allSettled([fetchCalendar(), fetchTasks(), fetchGroceries(), fetchMorningMenu()]);
+  await Promise.allSettled([fetchCalendar(), fetchMorningMenu()]);
 }
 
 /* =========================================================================
@@ -2951,6 +2964,7 @@ function activityWho(ev) {
 }
 
 function renderAfterSchool() {
+  renderAfterSchoolTasks();
   const el = document.getElementById('afterSchoolList');
   const today = boardNow();
   document.getElementById('afterSchoolDay').textContent =
@@ -2988,14 +3002,125 @@ function renderAfterSchool() {
   }).join('');
 }
 
+/* =========================================================================
+   AFTER-SCHOOL TASKS
+   Scheduled chores and one-off tasks live only on this device. A checked
+   one-off remains visible until the date changes; unchecked tasks carry over.
+   ========================================================================= */
+const AFTER_TASKS_KEY = 'homeboard_after_school_tasks_v1';
+const AFTER_TASK_SCHEDULE = {
+  0: ['Clip Nails', 'Do Laundry'],
+  1: ['Shower'],
+  3: ['Shower'],
+  6: ['Shower'],
+};
+
+function loadAfterTaskState() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(AFTER_TASKS_KEY)) || {}; } catch (e) { saved = {}; }
+  saved.custom = Array.isArray(saved.custom) ? saved.custom : [];
+  saved.recurringDone = saved.recurringDone || {};
+  return saved;
+}
+let afterTaskState = loadAfterTaskState();
+
+function saveAfterTaskState() {
+  try { localStorage.setItem(AFTER_TASKS_KEY, JSON.stringify(afterTaskState)); } catch (e) { /* private mode */ }
+}
+
+function recurringAfterTasks(kid, date) {
+  return (AFTER_TASK_SCHEDULE[date.getDay()] || []).map((label, index) => ({
+    id: `recurring.${kid.id}.${date.getDay()}.${index}`,
+    label,
+    recurring: true,
+  }));
+}
+
+function visibleCustomAfterTasks(kid, todayKey) {
+  return afterTaskState.custom.filter(task =>
+    task.kid === kid.id && (!task.completedDay || task.completedDay === todayKey)
+  );
+}
+
+function renderAfterSchoolTasks() {
+  const board = document.getElementById('afterTaskBoard');
+  if (!board) return;
+  const today = boardNow();
+  const todayKey = dayKey(today);
+
+  // Completed one-off tasks have served their purpose after midnight.
+  afterTaskState.custom = afterTaskState.custom.filter(task => !task.completedDay || task.completedDay === todayKey);
+  // Old completion maps are no longer useful once their date has passed.
+  afterTaskState.recurringDone = Object.fromEntries(
+    Object.entries(afterTaskState.recurringDone).filter(([key]) => key.startsWith(todayKey + '.'))
+  );
+  saveAfterTaskState();
+
+  board.innerHTML = KIDS.map(kid => {
+    const tasks = [...recurringAfterTasks(kid, today), ...visibleCustomAfterTasks(kid, todayKey)];
+    const rows = tasks.length ? tasks.map(task => {
+      const doneKey = `${todayKey}.${task.id}`;
+      const done = task.recurring ? !!afterTaskState.recurringDone[doneKey] : task.completedDay === todayKey;
+      return `<li class="after-task-row${done ? ' is-done' : ''}">
+        <button type="button" class="check" data-after-toggle="${escapeHtml(task.id)}" data-kid="${kid.id}"
+          data-recurring="${task.recurring ? 'true' : 'false'}" aria-pressed="${done}"
+          aria-label="${done ? 'Mark not done' : 'Mark done'}: ${escapeHtml(task.label)}">${checkSVG()}</button>
+        <span class="after-task-label">${escapeHtml(task.label)}</span>
+      </li>`;
+    }).join('') : '<li class="after-task-empty">No tasks yet.</li>';
+
+    return `<section class="after-task-kid" style="--kid-color:${kid.color}">
+      <div class="after-task-head">${kid.name}</div>
+      <ul class="after-task-list">${rows}</ul>
+      <form class="after-task-add" data-after-add="${kid.id}">
+        <input name="task" aria-label="Add a task for ${kid.name}" placeholder="Add a task…" autocomplete="off">
+        <button type="submit" aria-label="Add task for ${kid.name}">+</button>
+      </form>
+    </section>`;
+  }).join('');
+}
+
+document.getElementById('afterTaskBoard').addEventListener('click', event => {
+  const button = event.target.closest('[data-after-toggle]');
+  if (!button) return;
+  const todayKey = dayKey();
+  const id = button.dataset.afterToggle;
+  if (button.dataset.recurring === 'true') {
+    const doneKey = `${todayKey}.${id}`;
+    afterTaskState.recurringDone[doneKey] = !afterTaskState.recurringDone[doneKey];
+  } else {
+    const task = afterTaskState.custom.find(item => item.id === id && item.kid === button.dataset.kid);
+    if (task) task.completedDay = task.completedDay === todayKey ? null : todayKey;
+  }
+  saveAfterTaskState();
+  renderAfterSchoolTasks();
+});
+
+document.getElementById('afterTaskBoard').addEventListener('submit', event => {
+  const form = event.target.closest('[data-after-add]');
+  if (!form) return;
+  event.preventDefault();
+  const input = form.elements.task;
+  const label = input.value.trim();
+  if (!label) return;
+  afterTaskState.custom.push({
+    id: `custom.${Date.now()}.${Math.random().toString(36).slice(2, 7)}`,
+    kid: form.dataset.afterAdd,
+    label,
+    createdDay: dayKey(),
+    completedDay: null,
+  });
+  saveAfterTaskState();
+  input.value = '';
+  renderAfterSchoolTasks();
+});
+
 function escapeHtml(str) {
   return (str || '').toString()
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 renderCalendar();
-renderTaskLanes();
-renderGroceries();
 renderMorningMenu();
 renderChecklists();
 renderAfterSchool();

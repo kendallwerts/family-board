@@ -401,6 +401,10 @@
   .after-task-add button { flex: 0 0 34px; border: 0; border-radius: 9px; background: var(--kid-color); color: #fff; font-size: 1.15rem; font-weight: 700; cursor: pointer; }
   .after-task-empty { padding: 8px 2px; color: var(--ink-soft); font-size: 0.76rem; font-style: italic; }
   .as-item { display: flex; align-items: flex-start; gap: 11px; min-width: 0; padding: 10px 12px; border-radius: 14px; background: #fff; border: 1px solid var(--line); border-left: 4px solid var(--as-color, var(--dusk)); }
+  .as-item.is-all-day { padding: 6px 10px; align-items: center; }
+  .as-item.is-all-day .as-icon { width: 30px; height: 30px; border-radius: 9px; font-size: 1rem; }
+  .as-item.is-all-day .as-title { font-size: clamp(0.78rem, 1.25vw, 0.95rem); }
+  .as-item.is-all-day .as-meta { margin-top: 2px; font-size: 0.64rem; }
   .as-icon {
     flex-shrink: 0; width: 42px; height: 42px; display: flex; align-items: center; justify-content: center;
     border-radius: 12px; font-size: 1.35rem; line-height: 1;
@@ -845,7 +849,7 @@
                 <div class="kid-grid" id="kidChecklists"></div>
               </div>
               <div class="after-school">
-                <h2 class="side-title">After School <span class="side-title-note" id="afterSchoolDay">Today</span></h2>
+                <h2 class="side-title"><span id="afterSchoolTitle">After School</span> <span class="side-title-note" id="afterSchoolDay">Today</span></h2>
                 <ul class="as-list" id="afterSchoolList"></ul>
                 <div class="after-task-board" id="afterTaskBoard" aria-label="After-school tasks"></div>
               </div>
@@ -2967,14 +2971,20 @@ function renderAfterSchool() {
   renderAfterSchoolTasks();
   const el = document.getElementById('afterSchoolList');
   const today = boardNow();
-  document.getElementById('afterSchoolDay').textContent =
-    today.toLocaleDateString(undefined, { weekday: 'long' });
+  const isWeekend = today.getDay() === 0 || today.getDay() === 6;
+  document.getElementById('afterSchoolTitle').textContent = isWeekend ? 'Events' : 'After School';
+  document.getElementById('afterSchoolDay').textContent = isWeekend
+    ? ''
+    : today.toLocaleDateString(undefined, { weekday: 'long' });
   const items = currentEvents()
-    .filter(ev => !ev.allDay && ev.start.toDateString() === today.toDateString() && ev.start.getHours() >= AFTER_SCHOOL_FROM_HOUR)
-    .sort((a, b) => a.start - b.start);
+    .filter(ev =>
+      ev.start.toDateString() === today.toDateString() &&
+      (isWeekend || ev.allDay || ev.start.getHours() >= AFTER_SCHOOL_FROM_HOUR)
+    )
+    .sort((a, b) => Number(b.allDay) - Number(a.allDay) || a.start - b.start);
 
   if (!items.length) {
-    el.innerHTML = '<li class="as-empty">Nothing on the calendar after school today.</li>';
+    el.innerHTML = `<li class="as-empty">${isWeekend ? 'Nothing on the calendar today.' : 'Nothing on the calendar after school today.'}</li>`;
     return;
   }
   el.innerHTML = items.map(ev => {
@@ -2985,7 +2995,7 @@ function renderAfterSchool() {
       .replace(new RegExp(`\\s*[—–-]\\s*${who.label}\\s*$`, 'i'), '')
       .trim();
     return `
-    <li class="as-item" style="--as-color:${who.color}">
+    <li class="as-item${ev.allDay ? ' is-all-day' : ''}" style="--as-color:${who.color}">
       <span class="as-icon" aria-hidden="true">${activityIcon(ev)}</span>
       <div class="as-body">
         <div class="as-line">
@@ -2993,7 +3003,7 @@ function renderAfterSchool() {
           <span class="as-who">${escapeHtml(who.label)}</span>
         </div>
         <div class="as-meta">
-          <span>🕐 ${ev.start.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span>
+          <span>${ev.allDay ? 'All day' : `🕐 ${ev.start.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`}</span>
           ${ev.location ? `<span>📍 ${escapeHtml(ev.location)}</span>` : ''}
         </div>
         ${ev.note ? `<div class="as-note">🔔 ${escapeHtml(ev.note)}</div>` : ''}

@@ -1,0 +1,48 @@
+name: GroupMe school digest source
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 6:45 PM America/Chicago across DST changes:
+    # 23:45 UTC during CDT and 00:45 UTC during CST.
+    - cron: "45 23 * * *"
+    - cron: "45 0 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Central-time schedule
+        id: gate
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || [[ "$(TZ=America/Chicago date +%H)" == "18" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping duplicate UTC schedule; it is not 6 PM Central."
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - name: Fetch recent school GroupMe messages
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GROUPME_ACCESS_TOKEN: ${{ secrets.GROUPME_ACCESS_TOKEN }}
+          GROUPME_GROUP_NAMES: ${{ vars.GROUPME_GROUP_NAMES }}
+          GROUPME_GROUP_IDS: ${{ vars.GROUPME_GROUP_IDS }}
+          GROUPME_LOOKBACK_HOURS: ${{ vars.GROUPME_LOOKBACK_HOURS || '36' }}
+        run: python3 scripts/groupme_digest.py
+
+      - name: Upload GroupMe digest source
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: groupme-school-digest
+          path: artifacts/groupme/
+          retention-days: 7
+          if-no-files-found: error
